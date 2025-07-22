@@ -30,6 +30,7 @@ use cosmic::{
 use cosmic_greeter_config::Config as CosmicGreeterConfig;
 use cosmic_greeter_daemon::UserData;
 use greetd_ipc::Request;
+use std::sync::LazyLock;
 use std::{
     collections::{HashMap, hash_map},
     error::Error,
@@ -45,9 +46,11 @@ use wayland_client::{Proxy, protocol::wl_output::WlOutput};
 use zbus::{Connection, proxy};
 
 use crate::{
-    common::{self, Common},
+    common::{self, Common, DEFAULT_MENU_ITEM_HEIGHT},
     fl,
 };
+
+static USERNAME_ID: LazyLock<iced::id::Id> = LazyLock::new(|| iced::id::Id::new("username-id"));
 
 #[proxy(
     interface = "com.system76.CosmicGreeter",
@@ -111,7 +114,6 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     // Sort user data by uid
     user_datas.sort_by(|a, b| a.uid.cmp(&b.uid));
-
     let (mut greeter_config, greeter_config_handler) = CosmicGreeterConfig::load();
     // Filter out users that were removed from the system since the last time we loaded config
     greeter_config.users.retain(|uid, _| {
@@ -351,6 +353,7 @@ pub enum Message {
     Surface(surface::Action),
     Suspend,
     Username(String),
+    EnterUser(bool, String),
 }
 
 impl From<common::Message> for Message {
@@ -372,6 +375,7 @@ pub struct App {
     dialog_page_opt: Option<DialogPage>,
     dropdown_opt: Option<Dropdown>,
     heartbeat_handle: Option<cosmic::iced::task::Handle>,
+    entering_name: bool,
 }
 
 impl App {
@@ -430,8 +434,20 @@ impl App {
                     .on_press(message),
                 )
             };
-            let dropdown_menu = |items| {
-                widget::container(widget::column::with_children(items))
+            let dropdown_menu = |items: Vec<_>| {
+                let item_cnt = items.len();
+
+                let items = widget::column::with_children(items);
+                let items = if item_cnt > 7 {
+                    Element::from(
+                        widget::scrollable(items)
+                            .height(Length::Fixed(DEFAULT_MENU_ITEM_HEIGHT * 7.)),
+                    )
+                } else {
+                    Element::from(items)
+                };
+
+                widget::container(items)
                     .padding(1)
                     //TODO: move style to libcosmic
                     .class(theme::Container::custom(|theme| {
@@ -485,7 +501,29 @@ impl App {
                         Message::Username(name.clone()),
                     ));
                 }
-                user_button = user_button.popup(dropdown_menu(items));
+                let item_cnt = items.len();
+                let menu_button = widget::menu::menu_button(vec![
+                    Element::from(widget::Space::with_width(Length::Fixed(25.0))),
+                    widget::text(fl!("enter-user"))
+                        .align_x(iced::alignment::Horizontal::Left)
+                        .into(),
+                ])
+                .on_press(Message::EnterUser(true, String::new()))
+                .into();
+                let items = if item_cnt >= 6 {
+                    dropdown_menu(vec![
+                        widget::scrollable(widget::column::with_children(items))
+                            .height(Length::Fixed(DEFAULT_MENU_ITEM_HEIGHT * 6.))
+                            .into(),
+                        widget::divider::horizontal::light().into(),
+                        menu_button,
+                    ])
+                } else {
+                    items.push(menu_button);
+                    dropdown_menu(items)
+                };
+
+                user_button = user_button.popup(items);
             }
 
             let mut session_button = widget::popover(
@@ -575,7 +613,8 @@ impl App {
                 }
                 SocketState::Open => {
                     for user_data in &self.flags.user_datas {
-                        if user_data.name == self.selected_username.username {
+                        if !self.entering_name && user_data.name == self.selected_username.username
+                        {
                             match &user_data.icon_opt {
                                 Some(icon) => {
                                     column = column.push(
@@ -599,6 +638,17 @@ impl App {
                                     .align_x(alignment::Horizontal::Center),
                             );
                         }
+                    }
+                    if self.entering_name {
+                        column = column.push(
+                            widget::text_input(
+                                fl!("type-username"),
+                                self.selected_username.username.as_str(),
+                            )
+                            .id(USERNAME_ID.clone())
+                            .on_input(|input| Message::EnterUser(false, input))
+                            .on_submit(|v| Message::Username(v)),
+                        )
                     }
                     match &self.common.prompt_opt {
                         Some((prompt, secret, value_opt)) => match value_opt {
@@ -795,12 +845,6 @@ impl App {
             None => Task::none(),
         }
     }
-
-    fn user_data_index(user_datas: &[UserData], username: &str) -> Option<usize> {
-        user_datas
-            .binary_search_by(|probe| probe.name.as_str().cmp(username))
-            .ok()
-    }
 }
 
 /// Implement [`cosmic::Application`] to integrate with COSMIC.
@@ -840,11 +884,22 @@ impl cosmic::Application for App {
             .collect();
         usernames.sort_by(|a, b| a.1.cmp(&b.1));
 
-        //TODO: use last selected user
-        let (username, uid) = flags
-            .user_datas
-            .first()
-            .map(|x| (x.name.clone(), NonZeroU32::new(x.uid)))
+        let last_user = flags.greeter_config.last_user.as_ref();
+
+        let (username, uid) = last_user
+            .and_then(|last_user| {
+                flags
+                    .user_datas
+                    .iter()
+                    .find(|d| d.uid == last_user.get())
+                    .map(|x| (x.name.clone(), NonZeroU32::new(x.uid)))
+            })
+            .or_else(|| {
+                flags
+                    .user_datas
+                    .first()
+                    .map(|x| (x.name.clone(), NonZeroU32::new(x.uid)))
+            })
             .unwrap_or_default();
 
         let mut session_names: Vec<_> = flags.sessions.keys().map(|x| x.to_string()).collect();
@@ -875,6 +930,7 @@ impl cosmic::Application for App {
             dialog_page_opt: None,
             dropdown_opt: None,
             heartbeat_handle: None,
+            entering_name: false,
         };
         (app, common_task)
     }
@@ -1035,12 +1091,34 @@ impl cosmic::Application for App {
                     self.dropdown_opt = None;
                 }
             }
+            Message::EnterUser(focus_input, username) => {
+                if self.dropdown_opt == Some(Dropdown::User) {
+                    self.dropdown_opt = None;
+                }
+                self.entering_name = true;
+                self.selected_username = NameIndexPair {
+                    data_idx: self
+                        .flags
+                        .user_datas
+                        .iter()
+                        .position(|d| d.name == username),
+                    username,
+                };
+                if focus_input {
+                    return widget::text_input::focus(USERNAME_ID.clone());
+                }
+            }
             Message::Username(username) => {
                 if self.dropdown_opt == Some(Dropdown::User) {
                     self.dropdown_opt = None;
                 }
-                if username != self.selected_username.username {
-                    let data_idx = Self::user_data_index(&self.flags.user_datas, &username);
+                if self.entering_name || username != self.selected_username.username {
+                    self.entering_name = false;
+                    let data_idx = self
+                        .flags
+                        .user_datas
+                        .iter()
+                        .position(|d| d.name == username);
                     self.selected_username = NameIndexPair { username, data_idx };
                     self.common.surface_images.clear();
                     if let Some(session) = data_idx.and_then(|i| {
@@ -1078,7 +1156,11 @@ impl cosmic::Application for App {
                                 .map(|uid| self.flags.greeter_config.users.entry(uid))
                         })
                 }) else {
-                    log::error!("Couldn't find user: {:?}", self.selected_username.username);
+                    log::error!(
+                        "Couldn't find user: {:?} {:?}",
+                        self.selected_username.username,
+                        self.selected_username.data_idx,
+                    );
                     return Task::none();
                 };
 
@@ -1092,6 +1174,14 @@ impl cosmic::Application for App {
                 };
 
                 let uid = *user_entry.key();
+                self.flags.greeter_config.last_user = Some(uid);
+                if let Err(err) = handler.set("last_user", &self.flags.greeter_config.last_user) {
+                    log::error!(
+                        "Failed to set {:?} as last user: {:?}",
+                        self.flags.greeter_config.last_user,
+                        err
+                    );
+                }
                 match user_entry {
                     hash_map::Entry::Vacant(entry) => {
                         let last_session = Some(self.selected_session.clone());

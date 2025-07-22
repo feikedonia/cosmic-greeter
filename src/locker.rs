@@ -36,7 +36,7 @@ use tokio::{sync::mpsc, task};
 use wayland_client::{Proxy, protocol::wl_output::WlOutput};
 
 use crate::{
-    common::{self, Common},
+    common::{self, Common, DEFAULT_MENU_ITEM_HEIGHT},
     fl,
 };
 
@@ -293,8 +293,20 @@ impl App {
                     .on_press(message),
                 )
             };
-            let dropdown_menu = |items| {
-                widget::container(widget::column::with_children(items))
+            let dropdown_menu = |items: Vec<_>| {
+                let item_cnt = items.len();
+
+                let items = widget::column::with_children(items);
+                let items = if item_cnt > 7 {
+                    Element::from(
+                        widget::scrollable(items)
+                            .height(Length::Fixed(DEFAULT_MENU_ITEM_HEIGHT * 7.)),
+                    )
+                } else {
+                    Element::from(items)
+                };
+
+                widget::container(items)
                     .padding(1)
                     //TODO: move style to libcosmic
                     .class(theme::Container::custom(|theme| {
@@ -788,8 +800,8 @@ impl cosmic::Application for App {
 
                     // Allow suspend
                     self.inhibit_opt = None;
-                    // Create lock surfaces
 
+                    // Create lock surfaces
                     for (output, surface_id) in self.common.surface_ids.iter() {
                         commands.push(get_lock_surface(*surface_id, output.clone()));
 
@@ -869,9 +881,14 @@ impl cosmic::Application for App {
                     self.dropdown_opt = Some(dropdown);
                 }
             }
-            Message::Inhibit(inhibit) => {
-                self.inhibit_opt = Some(inhibit);
-            }
+            Message::Inhibit(inhibit) => match self.state {
+                State::Locked { .. } => {
+                    log::info!("no need to inhibit sleep when already locked");
+                }
+                _ => {
+                    self.inhibit_opt = Some(inhibit);
+                }
+            },
             Message::KeyboardLayout(layout_i) => {
                 if layout_i < self.common.active_layouts.len() {
                     self.common.active_layouts.swap(0, layout_i);
